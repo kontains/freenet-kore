@@ -61,7 +61,7 @@ impl ContractExecutor for Executor<Runtime> {
                         if remove_if_fail {
                             let _ = self.runtime.contract_store.remove_contract(&key);
                         }
-                        ExecutorError::other(err)
+                        ExecutorError::execution(err, None)
                     })?;
                 match result {
                     ValidateResult::Valid => {
@@ -262,7 +262,7 @@ impl Executor<Runtime> {
             )
             .await
         {
-            match err.0 {
+            match err.inner {
                 Either::Left(err) => tracing::error!("req error: {err}"),
                 Either::Right(err) => tracing::error!("other error: {err}"),
             }
@@ -306,12 +306,23 @@ impl Executor<Runtime> {
             }
             ContractRequest::Update { key, data } => self.perform_contract_update(key, data).await,
             // FIXME
+            // Handle Get requests by returning the contract state and optionally the contract code
             ContractRequest::Get {
                 key,
                 return_contract_code,
             } => match self.perform_contract_get(return_contract_code, key).await {
-                Ok(_) => todo!(),
-                Err(_) => todo!(),
+                Ok((state, contract)) => Ok(ContractResponse::GetResponse {
+                    key,
+                    state: state.ok_or_else(|| {
+                        ExecutorError::request(StdContractError::Get {
+                            key,
+                            cause: "contract state not found".into(),
+                        })
+                    })?,
+                    contract,
+                }
+                .into()),
+                Err(err) => Err(err),
             },
             ContractRequest::Subscribe { key, summary } => {
                 tracing::debug!("subscribing to contract {key}");
@@ -323,8 +334,11 @@ impl Executor<Runtime> {
                 // by default a subscribe op has an implicit get
                 let _res = self.perform_contract_get(true, key).await?;
                 self.subscribe(key).await?;
-                // FIXME
-                todo!()
+                Ok(ContractResponse::SubscribeResponse {
+                    key,
+                    subscribed: true,
+                }
+                .into())
             }
             _ => Err(ExecutorError::other(anyhow::anyhow!("not supported"))),
         }
@@ -417,12 +431,12 @@ impl Executor<Runtime> {
                         .collect(),
                 ) {
                     Ok(values) => Ok(HostResponse::DelegateResponse { key, values }),
-
                     Err(err) => {
                         tracing::error!("failed executing delegate `{key}`: {err}");
-                        Err(ExecutorError::other(anyhow::anyhow!(
-                            "uncontrolled error while executing `{key}`"
-                        )))
+                        Err(ExecutorError::execution(
+                            err,
+                            Some(InnerOpError::Delegate(key)),
+                        ))
                     }
                 }
             }
@@ -494,7 +508,7 @@ impl Executor<Runtime> {
         let summary = self
             .runtime
             .summarize_state(&key, &parameters, &new_state)
-            .map_err(ExecutorError::other)?;
+            .map_err(|e| ExecutorError::execution(e, None))?;
         self.send_update_notification(&key, &parameters, &new_state)
             .await?;
 
@@ -740,7 +754,7 @@ impl Executor<Runtime> {
                 )
                 .map_err(|err| {
                     let _ = self.runtime.contract_store.remove_contract(&trying_key);
-                    ExecutorError::other(err)
+                    ExecutorError::execution(err, None)
                 })?;
 
             let is_valid = match result {
